@@ -8,6 +8,7 @@ extern "C" {
 #  error "this header requires Py_BUILD_CORE define"
 #endif
 
+#include "pycore_llist.h"     /* llist_data */
 #include "pycore_runtime.h"   /* PyRuntimeState */
 
 typedef enum {
@@ -122,13 +123,20 @@ static inline PyInterpreterState* _PyInterpreterState_GET(void) {
 
 
 /* Other */
+struct brc_queued_object;
 
-struct PyThreadStateOS {
-    PyThreadState *tstate;
-    PyThreadState *next_waiter;
-    PyMUTEX_T waiter_mutex;
-    PyCOND_T waiter_cond;
-    int waiter_counter;
+/* Biased reference counting per-thread state */
+struct brc_state {
+    struct llist_node node;
+    uintptr_t thread_id;
+    struct brc_queued_object *queue;
+};
+
+struct PyThreadStateImpl {
+    // semi-public fields are in PyThreadState
+    PyThreadState tstate;
+
+    struct brc_state brc;
 };
 
 PyAPI_FUNC(void) _PyThreadState_Init(

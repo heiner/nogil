@@ -9,7 +9,7 @@
 #include "pycore_pymem.h"         // _PyMem_SetDefaultAllocator()
 #include "pycore_pystate.h"       // _PyThreadState_GET()
 #include "pycore_sysmodule.h"
-#include "pyatomic.h"
+#include "pycore_refcnt.h"
 
 #include "parking_lot.h"
 
@@ -603,11 +603,15 @@ static PyThreadState *
 new_threadstate(PyInterpreterState *interp, int init)
 {
     _PyRuntimeState *runtime = interp->runtime;
-    PyThreadState *tstate = (PyThreadState *)PyMem_RawMalloc(sizeof(PyThreadState));
-    if (tstate == NULL) {
+
+    struct PyThreadStateImpl *tstate_impl = PyMem_RawMalloc(sizeof(struct PyThreadStateImpl));
+    if (tstate_impl == NULL) {
         return NULL;
     }
 
+    memset(tstate_impl, 0, sizeof(struct PyThreadStateImpl));
+
+    PyThreadState *tstate = &tstate_impl->tstate;
     tstate->interp = interp;
 
     tstate->status = _Py_THREAD_DETACHED;
@@ -687,6 +691,7 @@ _PyThreadState_Init(PyThreadState *tstate)
 {
     tstate->fast_thread_id = _Py_ThreadId();
     _PyParkingLot_InitThread();
+    _Py_queue_create(tstate);
     _PyGILState_NoteThreadState(&tstate->interp->runtime->gilstate, tstate);
 }
 
@@ -836,6 +841,8 @@ PyThreadState_Clear(PyThreadState *tstate)
         fprintf(stderr,
           "PyThreadState_Clear: warning: thread still has a frame\n");
     }
+
+    _Py_queue_destroy(tstate);
 
     /* Don't clear tstate->frame: it is a borrowed reference */
 
@@ -1259,6 +1266,33 @@ fail:
 done:
     HEAD_UNLOCK(runtime);
     return result;
+}
+
+void
+_Py_explicit_merge_all(void)
+{
+    _PyRuntimeState *runtime = &_PyRuntime;
+
+    /* Although the GIL is held, a few C API functions can be called
+     * without the GIL held, and in particular some that create and
+     * destroy thread and interpreter states.  Those can mutate the
+     * list of thread states we're traversing, so to prevent that we lock
+     * head_mutex for the duration.
+     */
+    HEAD_LOCK(runtime);
+    PyInterpreterState *i;
+    for (i = runtime->interpreters.head; i != NULL; i = i->next) {
+        PyThreadState *p;
+        for (p = i->tstate_head; p != NULL; p = p->next) {
+            HEAD_UNLOCK(runtime);
+            // FIXME (sgross): without the unlock we can deadlock. I think
+            // what happens is that a destructor releases the GIL and another thread
+            // acquires the GIL and then tries to HEAD_LOCK.
+            _Py_queue_process(p);
+            HEAD_LOCK(runtime);
+        }
+    }
+    HEAD_UNLOCK(runtime);
 }
 
 /* Python "auto thread state" API. */
