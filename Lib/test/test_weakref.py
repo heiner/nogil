@@ -1017,9 +1017,9 @@ class SubclassableWeakrefTestCase(TestBase):
         self.assertEqual(weakref.getweakrefcount(o), 3)
         refs = weakref.getweakrefs(o)
         self.assertEqual(len(refs), 3)
-        self.assertIs(r2, refs[0])
-        self.assertIn(r1, refs[1:])
-        self.assertIn(r3, refs[1:])
+        self.assertIn(r2, refs)
+        self.assertIn(r1, refs)
+        self.assertIn(r3, refs)
 
     def test_subclass_refs_dont_conflate_callbacks(self):
         class MyRef(weakref.ref):
