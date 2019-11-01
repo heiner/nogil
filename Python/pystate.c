@@ -11,6 +11,8 @@
 #include "pycore_sysmodule.h"
 #include "pyatomic.h"
 
+#include "parking_lot.h"
+
 /* --------------------------------------------------------------------------
 CAUTION
 
@@ -667,6 +669,7 @@ void
 _PyThreadState_Init(PyThreadState *tstate)
 {
     tstate->fast_thread_id = _Py_ThreadId();
+    _PyParkingLot_InitThread();
     _PyGILState_NoteThreadState(&tstate->interp->runtime->gilstate, tstate);
 }
 
@@ -888,6 +891,7 @@ tstate_delete_common(PyThreadState *tstate,
 
     if (is_current) {
         _PyThreadState_SET(NULL);
+        _PyParkingLot_DeinitThread();
     }
 }
 
