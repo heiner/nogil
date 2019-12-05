@@ -11,6 +11,7 @@
 #include "pycore_sysmodule.h"
 #include "pycore_refcnt.h"
 
+#include "lock.h"
 #include "parking_lot.h"
 #include "mimalloc.h"
 #include "mimalloc-internal.h"
@@ -606,13 +607,79 @@ PyInterpreterState_GetDict(PyInterpreterState *interp)
     return interp->dict;
 }
 
+void
+_PyInterpreterState_WaitForThreads(PyInterpreterState *interp)
+{
+    _PyRuntimeState *runtime = &_PyRuntime;
+    PyThreadState *tstate = PyThreadState_Get();
+
+    if (tstate->done_event) {
+        /* First, mark the active thread as done */
+        _PyEventRc *done_event = tstate->done_event;
+        tstate->done_event = NULL;
+        _PyEvent_Notify(&done_event->event);
+        _PyEventRc_Decref(done_event);
+    }
+
+    for (;;) {
+        _PyEventRc *done_event = NULL;
+
+        // Find a thread that's not yet finished.
+        HEAD_LOCK(runtime);
+        for (PyThreadState *p = interp->tstate_head; p != NULL; p = p->next) {
+            if (p == tstate) {
+                continue;
+            }
+            if (p->done_event && !p->daemon) {
+                done_event = p->done_event;
+                _PyEventRc_Incref(done_event);
+                break;
+            }
+        }
+        HEAD_UNLOCK(runtime);
+
+        if (!done_event) {
+            // No more non-daemon threads to wait on!
+            break;
+        }
+
+        // Wait for the other thread to finish. If we're interrupted, such
+        // as by a ctrl-c we print the error and exit early.
+        for (;;) {
+            if (_PyEvent_TimedWait(&done_event->event, -1)) {
+                break;
+            }
+
+            // interrupted
+            if (Py_MakePendingCalls() < 0) {
+                PyErr_WriteUnraisable(NULL);
+                _PyEventRc_Decref(done_event);
+                return;
+            }
+        }
+
+        _PyEventRc_Decref(done_event);
+    }
+}
+
 static PyThreadState *
-new_threadstate(PyInterpreterState *interp, int init)
+new_threadstate(PyInterpreterState *interp, int init, _PyEventRc *done_event)
 {
     _PyRuntimeState *runtime = interp->runtime;
 
+    if (done_event == NULL) {
+        done_event = _PyEventRc_New();
+        if (done_event == NULL) {
+            return NULL;
+        }
+    }
+    else {
+        _PyEventRc_Incref(done_event);
+    }
+
     struct PyThreadStateImpl *tstate_impl = PyMem_RawMalloc(sizeof(struct PyThreadStateImpl));
     if (tstate_impl == NULL) {
+        _PyEventRc_Decref(done_event);
         return NULL;
     }
 
@@ -652,8 +719,6 @@ new_threadstate(PyInterpreterState *interp, int init)
 
     tstate->trash_delete_nesting = 0;
     tstate->trash_delete_later = NULL;
-    tstate->on_delete = NULL;
-    tstate->on_delete_data = NULL;
 
     tstate->coroutine_origin_tracking_depth = 0;
 
@@ -664,6 +729,7 @@ new_threadstate(PyInterpreterState *interp, int init)
     tstate->context_ver = 1;
 
     tstate->ref_total = 0;
+    tstate->done_event = done_event;
 
     if (init) {
         _PyThreadState_Init(tstate);
@@ -684,13 +750,13 @@ new_threadstate(PyInterpreterState *interp, int init)
 PyThreadState *
 PyThreadState_New(PyInterpreterState *interp)
 {
-    return new_threadstate(interp, 1);
+    return new_threadstate(interp, 1, NULL);
 }
 
 PyThreadState *
-_PyThreadState_Prealloc(PyInterpreterState *interp)
+_PyThreadState_Prealloc(PyInterpreterState *interp, _PyEventRc *done_event)
 {
-    return new_threadstate(interp, 0);
+    return new_threadstate(interp, 0, done_event);
 }
 
 void
@@ -884,10 +950,6 @@ PyThreadState_Clear(PyThreadState *tstate)
     Py_CLEAR(tstate->async_gen_finalizer);
 
     Py_CLEAR(tstate->context);
-
-    if (tstate->on_delete != NULL) {
-        tstate->on_delete(tstate->on_delete_data);
-    }
 }
 
 /* Common code for PyThreadState_Delete() and PyThreadState_DeleteCurrent() */
@@ -914,6 +976,7 @@ tstate_delete_common(PyThreadState *tstate,
     }
 
     _PyRuntimeState *runtime = interp->runtime;
+    _PyEventRc *done_event;
 
     HEAD_LOCK(runtime);
     if (tstate->prev) {
@@ -925,11 +988,21 @@ tstate_delete_common(PyThreadState *tstate,
     if (tstate->next) {
         tstate->next->prev = tstate->prev;
     }
+    done_event = tstate->done_event;
+    tstate->done_event = NULL;
 #ifdef Py_REF_DEBUG
     runtime->ref_total += tstate->ref_total;
     tstate->ref_total = 0;
 #endif
     HEAD_UNLOCK(runtime);
+
+    // Notify threads waiting on Thread.join(). This should happen after the
+    // thread state is unlinked, but must happen before parking lot is
+    // deinitialized.
+    if (done_event) {
+        _PyEvent_Notify(&done_event->event);
+        _PyEventRc_Decref(done_event);
+    }
 
     if (gilstate->autoInterpreterState &&
         PyThread_tss_get(&gilstate->autoTSSkey) == tstate)
