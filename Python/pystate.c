@@ -13,6 +13,7 @@
 
 #include "parking_lot.h"
 #include "mimalloc.h"
+#include "mimalloc-internal.h"
 
 /* --------------------------------------------------------------------------
 CAUTION
@@ -886,6 +887,7 @@ PyThreadState_Clear(PyThreadState *tstate)
     }
 }
 
+bool _mi_heap_done(mi_heap_t* heap);
 
 /* Common code for PyThreadState_Delete() and PyThreadState_DeleteCurrent() */
 static void
@@ -897,6 +899,28 @@ tstate_delete_common(PyThreadState *tstate,
                       : tstate->status != _Py_THREAD_ATTACHED);
 
     _Py_EnsureTstateNotNULL(tstate);
+
+    if (tstate->heaps[0]->thread_id == _Py_ThreadId() &&
+        _Py_IsMainInterpreter(tstate)) {
+        // NOTE: this may be called from a different thread. This can
+        // happend during shutdown of the interpreter or after forking.
+        // In these cases we don't delete the heap, because it's not
+        // safe to call that function from a different thread.
+        // FIXME(sgross): the interpeter check isn't great. Threads that
+        // are only in subinterpreters will leak. It's trying to avoid
+        // the problem where the main heap gets reset after a sub-interpreter
+        // that shares the main thread gets destroyed. That will set pages_free_direct
+        // to NULL and break mi_malloc calls.
+        mi_thread_done();
+        if (tstate->heaps[mi_heap_tag_default]) {
+            _mi_heap_done(tstate->heaps[mi_heap_tag_default]);
+        }
+    }
+
+    for (int tag = 0; tag < Py_NUM_HEAPS; tag++) {
+        tstate->heaps[tag] = NULL;
+    }
+
     PyInterpreterState *interp = tstate->interp;
     if (interp == NULL) {
         Py_FatalError("NULL interpreter");
@@ -1057,7 +1081,12 @@ _PyThreadState_Swap(struct _gilstate_runtime_state *gilstate, PyThreadState *new
 
     if (newts) {
         // XXX: shouldn't be necessary, but subinterpter tests move between threads!
-        newts->fast_thread_id = _Py_ThreadId();
+        if (_PY_UNLIKELY(newts->fast_thread_id != _Py_ThreadId())) {
+            newts->fast_thread_id = _Py_ThreadId();
+            for (int tag = 0; tag < Py_NUM_HEAPS; tag++) {
+                newts->heaps[tag] = mi_heap_get_tag(tag);
+            }
+        }
 
         int attached = _PyThreadState_Attach(newts);
         if (!attached) {
