@@ -68,6 +68,7 @@ _PyRuntimeState_Init_impl(_PyRuntimeState *runtime)
     runtime->open_code_userdata = open_code_userdata;
     runtime->audit_hook_head = audit_hook_head;
 
+    _PyGC_ResetHeap();
     _PyEval_InitRuntimeState(&runtime->ceval);
 
     PyPreConfig_InitPythonConfig(&runtime->preconfig);
@@ -696,8 +697,10 @@ void
 _PyThreadState_Init(PyThreadState *tstate)
 {
     tstate->fast_thread_id = _Py_ThreadId();
+    mi_tld_t *tld = mi_heap_get_default()->tld;
+    mi_atomic_increment(&tld->refcount);
     for (int tag = 0; tag < Py_NUM_HEAPS; tag++) {
-        tstate->heaps[tag] = mi_heap_get_tag(tag);
+        tstate->heaps[tag] = &tld->heaps[tag];
     }
     _PyParkingLot_InitThread();
     _Py_queue_create(tstate);
@@ -887,8 +890,6 @@ PyThreadState_Clear(PyThreadState *tstate)
     }
 }
 
-bool _mi_heap_done(mi_heap_t* heap);
-
 /* Common code for PyThreadState_Delete() and PyThreadState_DeleteCurrent() */
 static void
 tstate_delete_common(PyThreadState *tstate,
@@ -900,23 +901,9 @@ tstate_delete_common(PyThreadState *tstate,
 
     _Py_EnsureTstateNotNULL(tstate);
 
-    if (tstate->heaps[0]->thread_id == _Py_ThreadId() &&
-        _Py_IsMainInterpreter(tstate)) {
-        // NOTE: this may be called from a different thread. This can
-        // happend during shutdown of the interpreter or after forking.
-        // In these cases we don't delete the heap, because it's not
-        // safe to call that function from a different thread.
-        // FIXME(sgross): the interpeter check isn't great. Threads that
-        // are only in subinterpreters will leak. It's trying to avoid
-        // the problem where the main heap gets reset after a sub-interpreter
-        // that shares the main thread gets destroyed. That will set pages_free_direct
-        // to NULL and break mi_malloc calls.
-        mi_thread_done();
-        if (tstate->heaps[mi_heap_tag_default]) {
-            _mi_heap_done(tstate->heaps[mi_heap_tag_default]);
-        }
+    if (tstate->heaps[0] != NULL) {
+        _mi_thread_abandon(tstate->heaps[0]->tld);
     }
-
     for (int tag = 0; tag < Py_NUM_HEAPS; tag++) {
         tstate->heaps[tag] = NULL;
     }
@@ -924,10 +911,6 @@ tstate_delete_common(PyThreadState *tstate,
     PyInterpreterState *interp = tstate->interp;
     if (interp == NULL) {
         Py_FatalError("NULL interpreter");
-    }
-
-    for (int tag = 0; tag < Py_NUM_HEAPS; tag++) {
-        tstate->heaps[tag] = NULL;
     }
 
     _PyRuntimeState *runtime = interp->runtime;
@@ -1002,46 +985,63 @@ PyThreadState_DeleteCurrent(void)
 
 
 /*
- * Delete all thread states except the one passed as argument.
+ * Detaches all thread states except the one passed as argument.
  * Note that, if there is a current thread state, it *must* be the one
  * passed as argument.  Also, this won't touch any other interpreters
  * than the current one, since we don't know which thread state should
  * be kept in those other interpreters.
  */
-void
-_PyThreadState_DeleteExcept(_PyRuntimeState *runtime, PyThreadState *tstate)
+PyThreadState *
+_PyThreadState_UnlinkExcept(_PyRuntimeState *runtime, PyThreadState *tstate, int already_dead)
 {
     PyInterpreterState *interp = tstate->interp;
-
     HEAD_LOCK(runtime);
     /* Remove all thread states, except tstate, from the linked list of
        thread states.  This will allow calling PyThreadState_Clear()
        without holding the lock. */
-    PyThreadState *list = interp->tstate_head;
-    if (list == tstate) {
-        list = tstate->next;
-    }
-    if (tstate->prev) {
+    PyThreadState *garbage = interp->tstate_head;
+    if (garbage == tstate)
+        garbage = tstate->next;
+    if (tstate->prev)
         tstate->prev->next = tstate->next;
-    }
-    if (tstate->next) {
+    if (tstate->next)
         tstate->next->prev = tstate->prev;
-    }
     tstate->prev = tstate->next = NULL;
     interp->tstate_head = tstate;
+    interp->num_threads = 1;
     HEAD_UNLOCK(runtime);
 
-    /* Clear and deallocate all stale thread states.  Even if this
-       executes Python code, we should be safe since it executes
-       in the current thread, not one of the stale threads. */
-    PyThreadState *p, *next;
-    for (p = list; p; p = next) {
+    for (PyThreadState *p = garbage; p; p = p->next) {
+        if (p->heaps[0] != NULL) {
+            mi_tld_t *tld = p->heaps[0]->tld;
+            if (already_dead) {
+                assert(tld->status == 0);
+                tld->status = MI_THREAD_DEAD;
+            }
+            _mi_thread_abandon(tld);
+        }
+    }
+
+    return garbage;
+}
+
+void
+_PyThreadState_DeleteGarbage(PyThreadState *garbage)
+{
+    PyThreadState *next;
+    for (PyThreadState *p = garbage; p; p = next) {
         next = p->next;
         PyThreadState_Clear(p);
         PyMem_RawFree(p);
     }
 }
 
+void
+_PyThreadState_DeleteExcept(_PyRuntimeState *runtime, PyThreadState *tstate)
+{
+    PyThreadState *garbage = _PyThreadState_UnlinkExcept(runtime, tstate, 0);
+    _PyThreadState_DeleteGarbage(garbage);
+}
 
 PyThreadState *
 _PyThreadState_UncheckedGet(void)
@@ -1083,9 +1083,14 @@ _PyThreadState_Swap(struct _gilstate_runtime_state *gilstate, PyThreadState *new
         // XXX: shouldn't be necessary, but subinterpter tests move between threads!
         if (_PY_UNLIKELY(newts->fast_thread_id != _Py_ThreadId())) {
             newts->fast_thread_id = _Py_ThreadId();
+            if (newts->heaps[0] != NULL) {
+                _mi_thread_abandon(newts->heaps[0]->tld);
+            }
             for (int tag = 0; tag < Py_NUM_HEAPS; tag++) {
                 newts->heaps[tag] = mi_heap_get_tag(tag);
             }
+            assert(newts->heaps[0]->tld->refcount > 0);
+            mi_atomic_increment(&newts->heaps[0]->tld->refcount);
         }
 
         int attached = _PyThreadState_Attach(newts);

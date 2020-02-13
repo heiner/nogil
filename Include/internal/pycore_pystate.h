@@ -141,9 +141,11 @@ struct PyThreadStateImpl {
 
 PyAPI_FUNC(void) _PyThreadState_Init(
     PyThreadState *tstate);
-PyAPI_FUNC(void) _PyThreadState_DeleteExcept(
-    _PyRuntimeState *runtime,
-    PyThreadState *tstate);
+PyAPI_FUNC(void) _PyThreadState_DeleteExcept(_PyRuntimeState *runtime, PyThreadState *tstate);
+PyAPI_FUNC(PyThreadState *) _PyThreadState_UnlinkExcept(_PyRuntimeState *runtime,
+                                                        PyThreadState *tstate,
+                                                        int already_dead);
+PyAPI_FUNC(void) _PyThreadState_DeleteGarbage(PyThreadState *garbage);
 
 PyAPI_FUNC(PyThreadState *) _PyThreadState_Swap(
     struct _gilstate_runtime_state *gilstate,
