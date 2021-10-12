@@ -131,6 +131,14 @@ typedef int Py_ssize_clean_t;
 /* Smallest negative value of type Py_ssize_t. */
 #define PY_SSIZE_T_MIN (-PY_SSIZE_T_MAX-1)
 
+#if defined(__SSE2__)
+#define HAVE_SSE2 1
+#elif defined(_MSC_VER) && (defined(_M_X64) || (defined(_M_IX86) && _M_IX86_FP >= 2))
+#define HAVE_SSE2 1
+#elif defined(__ARM_NEON) || defined(__ARM_NEON__)
+#define HAVE_NEON 1
+#endif
+
 /* PY_FORMAT_SIZE_T is a platform-specific modifier for use in a printf
  * format to convert an argument with the width of a size_t or Py_ssize_t.
  * C99 introduced "z" for this purpose, but old MSVCs had not supported it.
@@ -534,6 +542,20 @@ extern "C" {
 #define _Py_COMP_DIAG_POP
 #endif
 
+/* _Py_LIKELY and _PY_UNLIKELY
+ * Provides the compiler with branch prediction information.
+ *
+ * Usage:
+ *   if (_PY_UNLIKELY(x == NULL)) { ... }
+ */
+#if defined(__GNUC__)
+#  define _PY_LIKELY(x)       __builtin_expect((x),1)
+#  define _PY_UNLIKELY(x)     __builtin_expect((x),0)
+#else
+#  define _PY_LIKELY(x)       (x)
+#  define _PY_UNLIKELY(x)     (x)
+#endif
+
 /* _Py_HOT_FUNCTION
  * The hot attribute on a function is used to inform the compiler that the
  * function is a hot spot of the compiled program. The function is optimized
@@ -569,6 +591,14 @@ extern "C" {
 #  define _Py_NO_INLINE __attribute__ ((noinline))
 #else
 #  define _Py_NO_INLINE
+#endif
+
+#if defined(_MSC_VER)
+#  define _Py_ALWAYS_INLINE __forceinline
+#elif defined(__GNUC__) || defined(__clang__)
+#  define _Py_ALWAYS_INLINE inline __attribute__ ((always_inline))
+#else
+#  define _Py_ALWAYS_INLINE inline
 #endif
 
 /**************************************************************************
@@ -762,6 +792,12 @@ extern char * _getpty(int *, int, mode_t, int);
 #define Py_ALIGNED(x) __attribute__((aligned(x)))
 #else
 #define Py_ALIGNED(x)
+#endif
+
+#ifdef _MSC_VER
+#define Py_DECL_THREAD __declspec(thread)
+#else
+#define Py_DECL_THREAD __thread
 #endif
 
 /* Eliminate end-of-loop code not reached warnings from SunPro C
