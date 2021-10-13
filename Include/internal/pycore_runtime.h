@@ -101,6 +101,8 @@ typedef struct pyruntimestate {
     void *open_code_userdata;
     _Py_AuditHookEntry *audit_hook_head;
 
+    Py_ssize_t ref_total;
+
     // XXX Consolidate globals found via the check-c-globals script.
 } _PyRuntimeState;
 
@@ -117,6 +119,8 @@ PyAPI_FUNC(void) _PyRuntimeState_Fini(_PyRuntimeState *runtime);
 #ifdef HAVE_FORK
 PyAPI_FUNC(void) _PyRuntimeState_ReInitThreads(_PyRuntimeState *runtime);
 #endif
+
+PyAPI_FUNC(Py_ssize_t) _PyRuntimeState_GetRefTotal(_PyRuntimeState *runtime);
 
 /* Initialize _PyRuntimeState.
    Return NULL on success, or return an error message on failure. */
